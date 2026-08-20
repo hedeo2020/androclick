@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AutoClick</string>
+    <string name="grant_overlay">Grant overlay permission</string>
+    <string name="enable_accessibility">Enable accessibility service</string>
+    <string name="start_controls">Start floating controls</string>
+    <string name="stop_controls">Stop floating controls</string>
+    <string name="overlay_channel_name">AutoClick controls</string>
+    <string name="notif_title">AutoClick is running</string>
+    <string name="notif_text">Tap the floating bubble to record or play a gesture</string>
+</resources>
