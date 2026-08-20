@@ -20,11 +20,12 @@ class GestureAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        Log.i(TAG, "Accessibility service connected")
+        Log.i(TAG, "Accessibility service connected, canPerformGestures should now be available")
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        Log.i(TAG, "Accessibility service destroyed/unbound")
         if (instance === this) instance = null
     }
 
@@ -44,11 +45,18 @@ class GestureAccessibilityService : AccessibilityService() {
         cancelled = false
         val maxDurationMs = maxGestureDurationMs()
         val batches = batchStrokes(recording.strokes, maxDurationMs)
+        Log.d(TAG, "play: ${recording.strokes.size} strokes split into ${batches.size} batch(es), maxGestureDuration=${maxDurationMs}ms")
         dispatchBatches(batches, 0, onFinished)
     }
 
     private fun dispatchBatches(batches: List<List<Stroke>>, index: Int, onFinished: () -> Unit) {
-        if (cancelled || index >= batches.size) {
+        if (cancelled) {
+            Log.d(TAG, "dispatchBatches: cancelled, stopping at batch $index/${batches.size}")
+            onFinished()
+            return
+        }
+        if (index >= batches.size) {
+            Log.d(TAG, "dispatchBatches: all ${batches.size} batch(es) done")
             onFinished()
             return
         }
@@ -61,20 +69,25 @@ class GestureAccessibilityService : AccessibilityService() {
                 if (i == 0) path.moveTo(point.x, point.y) else path.lineTo(point.x, point.y)
             }
             val relativeStart = stroke.startOffsetMs - batchStart
+            Log.d(TAG, "batch $index: stroke at (${stroke.points.first().x}, ${stroke.points.first().y}) relativeStart=${relativeStart}ms duration=${stroke.durationMs}ms")
             builder.addStroke(GestureDescription.StrokeDescription(path, relativeStart, stroke.durationMs))
         }
 
         val callback = object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
+                Log.d(TAG, "batch $index: onCompleted (system accepted and ran it)")
                 dispatchBatches(batches, index + 1, onFinished)
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
+                Log.w(TAG, "batch $index: onCancelled")
                 onFinished()
             }
         }
 
-        if (!dispatchGesture(builder.build(), callback, null)) {
+        val accepted = dispatchGesture(builder.build(), callback, null)
+        Log.d(TAG, "batch $index: dispatchGesture(...) returned accepted=$accepted")
+        if (!accepted) {
             Log.w(TAG, "dispatchGesture rejected batch $index")
             onFinished()
         }

@@ -16,6 +16,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.util.Log
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
@@ -65,6 +66,7 @@ class OverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Log.d(TAG, "OverlayService onCreate, accessibilityService.instance=${GestureAccessibilityService.instance}")
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         storage = RecordingStorage(this)
         startForeground(NOTIFICATION_ID, buildNotification())
@@ -77,6 +79,7 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        Log.d(TAG, "OverlayService onDestroy")
         timerHandler.removeCallbacksAndMessages(null)
         GestureAccessibilityService.instance?.stopPlayback()
         removeReticle()
@@ -162,11 +165,13 @@ class OverlayService : Service() {
     // ---- recording ----
 
     private fun onRecordButtonTapped() {
+        Log.d(TAG, "record button tapped (isRecording=$isRecording isPlaying=$isPlaying)")
         if (isPlaying) return
         if (isRecording) addTapPoint() else startRecording()
     }
 
     private fun onPlayButtonTapped() {
+        Log.d(TAG, "play button tapped (isRecording=$isRecording isPlaying=$isPlaying)")
         if (isRecording) {
             stopRecording()
             return
@@ -193,7 +198,11 @@ class OverlayService : Service() {
     }
 
     private fun addTapPoint() {
-        val reticle = reticleView ?: return
+        val reticle = reticleView
+        if (reticle == null) {
+            Log.w(TAG, "addTapPoint: reticleView is null, ignoring")
+            return
+        }
         val (x, y) = reticle.centerScreenPosition()
         val offset = SystemClock.elapsedRealtime() - recordingStartElapsed
         recordedStrokes.add(
@@ -202,6 +211,7 @@ class OverlayService : Service() {
                 points = listOf(TouchPoint(x, y, 0L), TouchPoint(x, y, TAP_DURATION_MS))
             )
         )
+        Log.d(TAG, "logged point #${recordedStrokes.size} at ($x, $y) offset=${offset}ms")
         Toast.makeText(this, "Point ${recordedStrokes.size} logged", Toast.LENGTH_SHORT).show()
     }
 
@@ -213,12 +223,14 @@ class OverlayService : Service() {
         setButtonIcon(R.id.btnPlay, R.drawable.ic_play)
 
         if (recordedStrokes.isEmpty()) {
+            Log.d(TAG, "stopRecording: nothing recorded")
             updateStatus("idle")
             Toast.makeText(this, "No points recorded", Toast.LENGTH_SHORT).show()
             return
         }
 
         storage.save(GestureRecording(RecordingStorage.DEFAULT_NAME, recordedStrokes.toList()))
+        Log.d(TAG, "stopRecording: saved ${recordedStrokes.size} points")
         updateStatus("saved (${recordedStrokes.size} pt${if (recordedStrokes.size == 1) "" else "s"})")
         Toast.makeText(this, "Gesture saved", Toast.LENGTH_SHORT).show()
     }
@@ -254,18 +266,22 @@ class OverlayService : Service() {
     private fun startPlayback() {
         val service = GestureAccessibilityService.instance
         if (service == null) {
+            Log.w(TAG, "startPlayback: GestureAccessibilityService.instance is null - not bound/enabled")
             Toast.makeText(this, "Enable the AutoClick accessibility service first", Toast.LENGTH_LONG).show()
             return
         }
         val recording = storage.latest()
         if (recording == null) {
+            Log.w(TAG, "startPlayback: no saved recording found")
             Toast.makeText(this, "No recorded gesture yet", Toast.LENGTH_SHORT).show()
             return
         }
+        Log.d(TAG, "startPlayback: playing '${recording.name}' with ${recording.strokes.size} strokes, totalDuration=${recording.totalDurationMs}ms")
         isPlaying = true
         setButtonIcon(R.id.btnPlay, R.drawable.ic_pause)
         updateStatus("playing")
         service.play(recording) {
+            Log.d(TAG, "startPlayback: playback finished")
             isPlaying = false
             setButtonIcon(R.id.btnPlay, R.drawable.ic_play)
             updateStatus("idle")
@@ -273,6 +289,7 @@ class OverlayService : Service() {
     }
 
     private fun stopPlayback() {
+        Log.d(TAG, "stopPlayback: user stopped playback")
         GestureAccessibilityService.instance?.stopPlayback()
         isPlaying = false
         setButtonIcon(R.id.btnPlay, R.drawable.ic_play)
@@ -319,6 +336,7 @@ class OverlayService : Service() {
     }
 
     companion object {
+        private const val TAG = "AutoClick"
         private const val NOTIFICATION_ID = 42
         private const val CHANNEL_ID = "autoclick_overlay"
         private const val RETICLE_SIZE_DP = 56
