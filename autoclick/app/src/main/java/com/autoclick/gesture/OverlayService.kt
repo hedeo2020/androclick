@@ -192,7 +192,7 @@ class OverlayService : Service() {
         timerHandler.post(timerTick)
         Toast.makeText(
             this,
-            "Drag the red target onto what you want tapped, then tap the check to log it",
+            "Short drag + check = log a tap. Long drag (like a real scroll) = logs a swipe.",
             Toast.LENGTH_LONG
         ).show()
     }
@@ -238,6 +238,7 @@ class OverlayService : Service() {
     private fun addReticle() {
         val metrics = resources.displayMetrics
         val sizePx = (RETICLE_SIZE_DP * metrics.density).toInt()
+        val swipeThresholdPx = SWIPE_THRESHOLD_DP * metrics.density
         val view = TargetReticleView(this, sizePx)
         val params = WindowManager.LayoutParams(
             sizePx, sizePx,
@@ -251,7 +252,7 @@ class OverlayService : Service() {
             x = (metrics.widthPixels - sizePx) / 2
             y = (metrics.heightPixels - sizePx) / 2
         }
-        view.setOnTouchListener(DragTouchListener(params, view))
+        view.setOnTouchListener(ReticleTouchListener(params, view, swipeThresholdPx))
         windowManager.addView(view, params)
         reticleView = view
     }
@@ -259,6 +260,67 @@ class OverlayService : Service() {
     private fun removeReticle() {
         reticleView?.let { runCatching { windowManager.removeView(it) } }
         reticleView = null
+    }
+
+    /**
+     * Drag-to-move the reticle like [DragTouchListener], but also records the full path in
+     * absolute screen coordinates. A short drag (under [swipeThresholdPx]) is treated as just
+     * repositioning the target for a later tap; a longer, deliberate drag is logged as a swipe
+     * stroke on release. A view that captures ACTION_DOWN keeps receiving ACTION_MOVE for that
+     * gesture even once the finger travels outside its bounds, so this works for full-screen
+     * swipes despite the reticle itself being small.
+     */
+    private inner class ReticleTouchListener(
+        private val params: WindowManager.LayoutParams,
+        private val view: View,
+        private val swipeThresholdPx: Float
+    ) : View.OnTouchListener {
+        private var downRawX = 0f
+        private var downRawY = 0f
+        private var downParamX = 0
+        private var downParamY = 0
+        private var downElapsed = 0L
+        private val pathPoints = mutableListOf<TouchPoint>()
+
+        override fun onTouch(v: View, event: MotionEvent): Boolean {
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    downParamX = params.x
+                    downParamY = params.y
+                    downElapsed = SystemClock.elapsedRealtime()
+                    pathPoints.clear()
+                    pathPoints.add(TouchPoint(event.rawX, event.rawY, 0L))
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    params.x = downParamX + (event.rawX - downRawX).toInt()
+                    params.y = downParamY + (event.rawY - downRawY).toInt()
+                    runCatching { windowManager.updateViewLayout(view, params) }
+                    pathPoints.add(TouchPoint(event.rawX, event.rawY, SystemClock.elapsedRealtime() - downElapsed))
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val distance = kotlin.math.hypot(
+                        (event.rawX - downRawX).toDouble(),
+                        (event.rawY - downRawY).toDouble()
+                    )
+                    if (distance >= swipeThresholdPx) {
+                        onSwipeRecorded(downElapsed, pathPoints.toList())
+                    }
+                    return true
+                }
+            }
+            return false
+        }
+    }
+
+    private fun onSwipeRecorded(downElapsed: Long, points: List<TouchPoint>) {
+        val offset = downElapsed - recordingStartElapsed
+        recordedStrokes.add(Stroke(startOffsetMs = offset, points = points))
+        Log.d(TAG, "logged swipe #${recordedStrokes.size} with ${points.size} points, duration=${points.last().offsetMs}ms")
+        Toast.makeText(this, "Swipe ${recordedStrokes.size} logged", Toast.LENGTH_SHORT).show()
     }
 
     // ---- playback ----
@@ -341,6 +403,7 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "autoclick_overlay"
         private const val RETICLE_SIZE_DP = 56
         private const val TAP_DURATION_MS = 60L
+        private const val SWIPE_THRESHOLD_DP = 24f
     }
 }
 
