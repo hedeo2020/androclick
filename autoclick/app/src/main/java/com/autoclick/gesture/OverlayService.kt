@@ -6,10 +6,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
@@ -24,24 +28,40 @@ import androidx.core.app.NotificationCompat
 import com.autoclick.gesture.model.GestureRecording
 import com.autoclick.gesture.model.Stroke
 import com.autoclick.gesture.model.TouchPoint
-import kotlin.math.abs
 
 /**
- * Owns the floating control bubble and, while recording, a full-screen
- * transparent capture view. Both are separate overlay windows so the bubble
- * always stays on top and clickable while the capture view underneath
- * swallows the rest of the screen's touches for recording.
+ * Owns the floating control bubble and, while recording, a small draggable
+ * target reticle. Recording works by point placement rather than live touch
+ * capture: a full-screen capture window would have to consume every touch to
+ * log it, which also blocks it from reaching the real app underneath (there
+ * is no way to both log and pass through a touch with a single overlay
+ * window, short of root). The reticle is a small window instead, so only its
+ * own bounds intercept touches - the rest of the screen stays fully usable
+ * while you position it.
  */
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
+    private lateinit var storage: RecordingStorage
+
     private var bubbleView: View? = null
-    private var captureView: TouchCaptureView? = null
+    private var reticleView: TargetReticleView? = null
 
     private var isRecording = false
     private var isPlaying = false
 
-    private lateinit var storage: RecordingStorage
+    private var recordingStartElapsed = 0L
+    private val recordedStrokes = mutableListOf<Stroke>()
+
+    private val timerHandler = Handler(Looper.getMainLooper())
+    private val timerTick = object : Runnable {
+        override fun run() {
+            if (!isRecording) return
+            val elapsedSec = (SystemClock.elapsedRealtime() - recordingStartElapsed) / 1000
+            updateStatus("REC %d:%02d".format(elapsedSec / 60, elapsedSec % 60))
+            timerHandler.postDelayed(this, 1000)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -57,8 +77,9 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        timerHandler.removeCallbacksAndMessages(null)
         GestureAccessibilityService.instance?.stopPlayback()
-        removeCaptureView()
+        removeReticle()
         bubbleView?.let { runCatching { windowManager.removeView(it) } }
         bubbleView = null
     }
@@ -87,25 +108,26 @@ class OverlayService : Service() {
             y = 200
         }
 
-        view.setOnTouchListener(BubbleDragTouchListener(params))
+        view.setOnTouchListener(DragTouchListener(params, view))
         // ImageButton children are clickable, so they consume their own touch sequence before
-        // the root's OnTouchListener ever sees it - real click listeners are required here,
-        // hit-testing taps from the root touch listener does not work.
-        view.findViewById<ImageButton>(R.id.btnRecord).setOnClickListener { onRecordTapped() }
-        view.findViewById<ImageButton>(R.id.btnPlay).setOnClickListener { onPlayTapped() }
+        // the root's OnTouchListener ever sees it - real click listeners are required here.
+        view.findViewById<ImageButton>(R.id.btnRecord).setOnClickListener { onRecordButtonTapped() }
+        view.findViewById<ImageButton>(R.id.btnPlay).setOnClickListener { onPlayButtonTapped() }
         view.findViewById<ImageButton>(R.id.btnClose).setOnClickListener { stopSelf() }
         windowManager.addView(view, params)
         bubbleView = view
         updateStatus("idle")
     }
 
-    private inner class BubbleDragTouchListener(private val params: WindowManager.LayoutParams) :
-        View.OnTouchListener {
+    /** Drag-to-move behaviour shared by the bubble and the reticle. */
+    private inner class DragTouchListener(
+        private val params: WindowManager.LayoutParams,
+        private val view: View
+    ) : View.OnTouchListener {
         private var downRawX = 0f
         private var downRawY = 0f
         private var downParamX = 0
         private var downParamY = 0
-        private var dragging = false
 
         override fun onTouch(v: View, event: MotionEvent): Boolean {
             when (event.action) {
@@ -114,18 +136,12 @@ class OverlayService : Service() {
                     downRawY = event.rawY
                     downParamX = params.x
                     downParamY = params.y
-                    dragging = false
                     return true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - downRawX
-                    val dy = event.rawY - downRawY
-                    if (dragging || abs(dx) > TOUCH_SLOP || abs(dy) > TOUCH_SLOP) {
-                        dragging = true
-                        params.x = downParamX + dx.toInt()
-                        params.y = downParamY + dy.toInt()
-                        runCatching { windowManager.updateViewLayout(v, params) }
-                    }
+                    params.x = downParamX + (event.rawX - downRawX).toInt()
+                    params.y = downParamY + (event.rawY - downRawY).toInt()
+                    runCatching { windowManager.updateViewLayout(view, params) }
                     return true
                 }
                 MotionEvent.ACTION_UP -> return true
@@ -136,82 +152,97 @@ class OverlayService : Service() {
 
     // ---- recording ----
 
-    private fun onRecordTapped() {
+    private fun onRecordButtonTapped() {
         if (isPlaying) return
-        if (isRecording) stopRecording() else startRecording()
+        if (isRecording) addTapPoint() else startRecording()
+    }
+
+    private fun onPlayButtonTapped() {
+        if (isRecording) {
+            stopRecording()
+            return
+        }
+        if (isPlaying) stopPlayback() else startPlayback()
     }
 
     private fun startRecording() {
+        if (GestureAccessibilityService.instance == null) {
+            Toast.makeText(this, "Tip: enable the accessibility service before playback", Toast.LENGTH_SHORT).show()
+        }
         isRecording = true
-        updateStatus("recording")
-        setRecordIcon(R.drawable.ic_stop)
+        recordedStrokes.clear()
+        recordingStartElapsed = SystemClock.elapsedRealtime()
+        addReticle()
+        setButtonIcon(R.id.btnRecord, R.drawable.ic_confirm)
+        setButtonIcon(R.id.btnPlay, R.drawable.ic_stop)
+        timerHandler.post(timerTick)
+        Toast.makeText(
+            this,
+            "Drag the red target onto what you want tapped, then tap the check to log it",
+            Toast.LENGTH_LONG
+        ).show()
+    }
 
-        val startElapsed = SystemClock.elapsedRealtime()
-        val strokes = mutableListOf<Stroke>()
-
-        val view = TouchCaptureView(this) { finishedStrokes ->
-            strokes.clear()
-            strokes.addAll(finishedStrokes)
-        }
-        view.recordingStartElapsed = startElapsed
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            overlayWindowType(),
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-        }
-
-        windowManager.addView(view, params)
-        captureView = view
-
-        // Re-add the bubble so it stays on top of the new full-screen capture window.
-        bubbleView?.let { b ->
-            runCatching { windowManager.removeView(b) }
-            windowManager.addView(b, b.layoutParams)
-        }
-
-        Toast.makeText(this, "Recording… tap the bubble again to stop", Toast.LENGTH_SHORT).show()
+    private fun addTapPoint() {
+        val reticle = reticleView ?: return
+        val (x, y) = reticle.centerScreenPosition()
+        val offset = SystemClock.elapsedRealtime() - recordingStartElapsed
+        recordedStrokes.add(
+            Stroke(
+                startOffsetMs = offset,
+                points = listOf(TouchPoint(x, y, 0L), TouchPoint(x, y, TAP_DURATION_MS))
+            )
+        )
+        Toast.makeText(this, "Point ${recordedStrokes.size} logged", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopRecording() {
         isRecording = false
-        setRecordIcon(R.drawable.ic_record)
-        val strokes = captureView?.finishAndGetStrokes() ?: emptyList()
-        removeCaptureView()
+        timerHandler.removeCallbacksAndMessages(null)
+        removeReticle()
+        setButtonIcon(R.id.btnRecord, R.drawable.ic_record)
+        setButtonIcon(R.id.btnPlay, R.drawable.ic_play)
 
-        if (strokes.isEmpty()) {
+        if (recordedStrokes.isEmpty()) {
             updateStatus("idle")
-            Toast.makeText(this, "No touches recorded", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "No points recorded", Toast.LENGTH_SHORT).show()
             return
         }
 
-        val recording = GestureRecording(RecordingStorage.DEFAULT_NAME, strokes)
-        storage.save(recording)
-        updateStatus("saved (${strokes.size} stroke${if (strokes.size == 1) "" else "s"})")
+        storage.save(GestureRecording(RecordingStorage.DEFAULT_NAME, recordedStrokes.toList()))
+        updateStatus("saved (${recordedStrokes.size} pt${if (recordedStrokes.size == 1) "" else "s"})")
         Toast.makeText(this, "Gesture saved", Toast.LENGTH_SHORT).show()
     }
 
-    private fun removeCaptureView() {
-        captureView?.let { runCatching { windowManager.removeView(it) } }
-        captureView = null
+    private fun addReticle() {
+        val metrics = resources.displayMetrics
+        val sizePx = (RETICLE_SIZE_DP * metrics.density).toInt()
+        val view = TargetReticleView(this, sizePx)
+        val params = WindowManager.LayoutParams(
+            sizePx, sizePx,
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (metrics.widthPixels - sizePx) / 2
+            y = (metrics.heightPixels - sizePx) / 2
+        }
+        view.setOnTouchListener(DragTouchListener(params, view))
+        windowManager.addView(view, params)
+        reticleView = view
+    }
+
+    private fun removeReticle() {
+        reticleView?.let { runCatching { windowManager.removeView(it) } }
+        reticleView = null
     }
 
     // ---- playback ----
 
-    private fun onPlayTapped() {
-        if (isRecording) return
-        if (isPlaying) {
-            GestureAccessibilityService.instance?.stopPlayback()
-            isPlaying = false
-            updateStatus("stopped")
-            return
-        }
+    private fun startPlayback() {
         val service = GestureAccessibilityService.instance
         if (service == null) {
             Toast.makeText(this, "Enable the AutoClick accessibility service first", Toast.LENGTH_LONG).show()
@@ -223,11 +254,20 @@ class OverlayService : Service() {
             return
         }
         isPlaying = true
+        setButtonIcon(R.id.btnPlay, R.drawable.ic_pause)
         updateStatus("playing")
         service.play(recording) {
             isPlaying = false
+            setButtonIcon(R.id.btnPlay, R.drawable.ic_play)
             updateStatus("idle")
         }
+    }
+
+    private fun stopPlayback() {
+        GestureAccessibilityService.instance?.stopPlayback()
+        isPlaying = false
+        setButtonIcon(R.id.btnPlay, R.drawable.ic_play)
+        updateStatus("idle")
     }
 
     // ---- helpers ----
@@ -236,8 +276,8 @@ class OverlayService : Service() {
         bubbleView?.findViewById<TextView>(R.id.txtStatus)?.text = text
     }
 
-    private fun setRecordIcon(resId: Int) {
-        bubbleView?.findViewById<ImageButton>(R.id.btnRecord)?.setImageResource(resId)
+    private fun setButtonIcon(viewId: Int, resId: Int) {
+        bubbleView?.findViewById<ImageButton>(viewId)?.setImageResource(resId)
     }
 
     private fun overlayWindowType(): Int =
@@ -272,52 +312,42 @@ class OverlayService : Service() {
     companion object {
         private const val NOTIFICATION_ID = 42
         private const val CHANNEL_ID = "autoclick_overlay"
-        private const val TOUCH_SLOP = 12f
+        private const val RETICLE_SIZE_DP = 56
+        private const val TAP_DURATION_MS = 60L
     }
 }
 
-/**
- * Full-screen transparent view used only while recording: captures every
- * finger-down-to-finger-up path as a [Stroke] timed relative to when
- * recording started.
- */
-private class TouchCaptureView(
-    context: Context,
-    private val onStrokesUpdated: (List<Stroke>) -> Unit
-) : View(context) {
+/** Small draggable circular target the user positions over whatever they want tapped while recording. */
+private class TargetReticleView(context: Context, private val sizePx: Int) : View(context) {
 
-    var recordingStartElapsed: Long = SystemClock.elapsedRealtime()
-
-    private val strokes = mutableListOf<Stroke>()
-    private var currentPoints: MutableList<TouchPoint>? = null
-    private var currentStrokeStart = 0L
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(160, 255, 82, 82)
+        style = Paint.Style.FILL
+    }
+    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
 
     init {
-        setBackgroundColor(Color.TRANSPARENT)
+        // A plain View skips onDraw() by default unless this is cleared (the optimization
+        // assumes a backgroundless view has nothing to paint).
+        setWillNotDraw(false)
     }
 
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        val now = SystemClock.elapsedRealtime()
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                currentStrokeStart = now - recordingStartElapsed
-                currentPoints = mutableListOf(TouchPoint(event.x, event.y, 0L))
-            }
-            MotionEvent.ACTION_MOVE -> {
-                val strokeElapsed = now - recordingStartElapsed - currentStrokeStart
-                currentPoints?.add(TouchPoint(event.x, event.y, strokeElapsed))
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                val points = currentPoints
-                if (points != null && points.isNotEmpty()) {
-                    strokes.add(Stroke(currentStrokeStart, points))
-                    onStrokesUpdated(strokes.toList())
-                }
-                currentPoints = null
-            }
-        }
-        return true
+    override fun onDraw(canvas: Canvas) {
+        val r = sizePx / 2f
+        canvas.drawCircle(r, r, r - 4f, fillPaint)
+        canvas.drawCircle(r, r, r - 4f, strokePaint)
+        canvas.drawLine(r, 8f, r, sizePx - 8f, strokePaint)
+        canvas.drawLine(8f, r, sizePx - 8f, r, strokePaint)
     }
 
-    fun finishAndGetStrokes(): List<Stroke> = strokes.toList()
+    /** Absolute on-screen coordinates of this view's center, matching what dispatchGesture expects. */
+    fun centerScreenPosition(): Pair<Float, Float> {
+        val loc = IntArray(2)
+        getLocationOnScreen(loc)
+        return Pair(loc[0] + width / 2f, loc[1] + height / 2f)
+    }
 }
