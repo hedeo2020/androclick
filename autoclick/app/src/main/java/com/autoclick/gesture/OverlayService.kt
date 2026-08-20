@@ -113,7 +113,16 @@ class OverlayService : Service() {
         // the root's OnTouchListener ever sees it - real click listeners are required here.
         view.findViewById<ImageButton>(R.id.btnRecord).setOnClickListener { onRecordButtonTapped() }
         view.findViewById<ImageButton>(R.id.btnPlay).setOnClickListener { onPlayButtonTapped() }
-        view.findViewById<ImageButton>(R.id.btnClose).setOnClickListener { stopSelf() }
+        // Close is long-press-only: it sits right next to Play/Stop&Save in a small bubble, and
+        // a plain single tap here was repeatedly killing the service by accident (confirmed via
+        // logcat - a tap on this window was immediately followed by destroyService each time).
+        view.findViewById<ImageButton>(R.id.btnClose).setOnClickListener {
+            Toast.makeText(this, "Long-press to close", Toast.LENGTH_SHORT).show()
+        }
+        view.findViewById<ImageButton>(R.id.btnClose).setOnLongClickListener {
+            stopSelf()
+            true
+        }
         windowManager.addView(view, params)
         bubbleView = view
         updateStatus("idle")
