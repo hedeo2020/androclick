@@ -88,6 +88,12 @@ class OverlayService : Service() {
         }
 
         view.setOnTouchListener(BubbleDragTouchListener(params))
+        // ImageButton children are clickable, so they consume their own touch sequence before
+        // the root's OnTouchListener ever sees it - real click listeners are required here,
+        // hit-testing taps from the root touch listener does not work.
+        view.findViewById<ImageButton>(R.id.btnRecord).setOnClickListener { onRecordTapped() }
+        view.findViewById<ImageButton>(R.id.btnPlay).setOnClickListener { onPlayTapped() }
+        view.findViewById<ImageButton>(R.id.btnClose).setOnClickListener { stopSelf() }
         windowManager.addView(view, params)
         bubbleView = view
         updateStatus("idle")
@@ -122,26 +128,9 @@ class OverlayService : Service() {
                     }
                     return true
                 }
-                MotionEvent.ACTION_UP -> {
-                    if (!dragging) handleBubbleTap(v, event.x, event.y)
-                    return true
-                }
+                MotionEvent.ACTION_UP -> return true
             }
             return false
-        }
-    }
-
-    private fun handleBubbleTap(root: View, x: Float, y: Float) {
-        val hit = fun(id: Int): Boolean {
-            val child = root.findViewById<View>(id) ?: return false
-            val l = child.left
-            val t = child.top
-            return x >= l && x <= l + child.width && y >= t && y <= t + child.height
-        }
-        when {
-            hit(R.id.btnRecord) -> onRecordTapped()
-            hit(R.id.btnPlay) -> onPlayTapped()
-            hit(R.id.btnClose) -> stopSelf()
         }
     }
 
