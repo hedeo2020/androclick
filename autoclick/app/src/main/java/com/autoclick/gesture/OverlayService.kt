@@ -31,14 +31,16 @@ import com.autoclick.gesture.model.Stroke
 import com.autoclick.gesture.model.TouchPoint
 
 /**
- * Owns the floating control bubble and, while recording, a small draggable
- * target reticle. Recording works by point placement rather than live touch
- * capture: a full-screen capture window would have to consume every touch to
- * log it, which also blocks it from reaching the real app underneath (there
- * is no way to both log and pass through a touch with a single overlay
- * window, short of root). The reticle is a small window instead, so only its
- * own bounds intercept touches - the rest of the screen stays fully usable
- * while you position it.
+ * Owns the floating control bubble and two independent recording tools:
+ *
+ * - A small draggable target reticle for taps: drag it to line up precisely over a target, then
+ *   confirm to log a tap point. Its own window is small so only its own bounds intercept touches
+ *   - the rest of the screen stays fully usable while you position it.
+ * - A one-shot, full-screen swipe capture for swipes/scrolls: tapping the swipe button arms a
+ *   single momentary full-screen window that captures exactly one real drag wherever you actually
+ *   perform it (e.g. right over the list you want scrolled), then removes itself. Swipes don't go
+ *   through the reticle at all - dragging a tiny dot to imitate a scroll is imprecise and doesn't
+ *   need to happen where the dot starts out, whereas this captures the true gesture in place.
  */
 class OverlayService : Service() {
 
@@ -49,6 +51,7 @@ class OverlayService : Service() {
 
     private var reticleAnchorView: TargetReticleView? = null
     private var reticleAnchorParams: WindowManager.LayoutParams? = null
+    private var swipeCaptureView: View? = null
 
     private var isRecording = false
     private var isPlaying = false
@@ -85,6 +88,7 @@ class OverlayService : Service() {
         timerHandler.removeCallbacksAndMessages(null)
         GestureAccessibilityService.instance?.stopPlayback()
         removeReticle()
+        endSwipeCapture()
         bubbleView?.let { runCatching { windowManager.removeView(it) } }
         bubbleView = null
     }
@@ -117,6 +121,7 @@ class OverlayService : Service() {
         // ImageButton children are clickable, so they consume their own touch sequence before
         // the root's OnTouchListener ever sees it - real click listeners are required here.
         view.findViewById<ImageButton>(R.id.btnRecord).setOnClickListener { onRecordButtonTapped() }
+        view.findViewById<ImageButton>(R.id.btnSwipe).setOnClickListener { onSwipeButtonTapped() }
         view.findViewById<ImageButton>(R.id.btnPlay).setOnClickListener { onPlayButtonTapped() }
         // Close is long-press-only: it sits right next to Play/Stop&Save in a small bubble, and
         // a plain single tap here was repeatedly killing the service by accident (confirmed via
@@ -194,7 +199,7 @@ class OverlayService : Service() {
         timerHandler.post(timerTick)
         Toast.makeText(
             this,
-            "Short drag + check = log a tap. Long drag (like a real scroll) = logs a swipe.",
+            "Drag the dot + check = log a tap. Tap the swipe icon, then swipe/scroll on screen to log that.",
             Toast.LENGTH_LONG
         ).show()
     }
@@ -221,6 +226,7 @@ class OverlayService : Service() {
         isRecording = false
         timerHandler.removeCallbacksAndMessages(null)
         removeReticle()
+        endSwipeCapture()
         setButtonIcon(R.id.btnRecord, R.drawable.ic_record)
         setButtonIcon(R.id.btnPlay, R.drawable.ic_play)
 
@@ -242,7 +248,6 @@ class OverlayService : Service() {
     private fun addReticle() {
         val metrics = resources.displayMetrics
         val sizePx = (RETICLE_SIZE_DP * metrics.density).toInt()
-        val swipeThresholdPx = SWIPE_THRESHOLD_DP * metrics.density
         val anchor = TargetReticleView(this, sizePx)
         val anchorParams = WindowManager.LayoutParams(
             sizePx, sizePx,
@@ -254,7 +259,9 @@ class OverlayService : Service() {
             x = (metrics.widthPixels - sizePx) / 2
             y = (metrics.heightPixels - sizePx) / 2
         }
-        anchor.setOnTouchListener(ReticleTouchListener(anchorParams, anchor, sizePx, swipeThresholdPx))
+        // Plain drag-to-move, same as the bubble: the dot only ever repositions itself, it never
+        // tries to double as a swipe recorder, so there's no threshold to fight while pointing it.
+        anchor.setOnTouchListener(DragTouchListener(anchorParams, anchor))
         windowManager.addView(anchor, anchorParams)
         reticleAnchorView = anchor
         reticleAnchorParams = anchorParams
@@ -266,74 +273,81 @@ class OverlayService : Service() {
         reticleAnchorParams = null
     }
 
-    /**
-     * Tracks a drag on the reticle and records the full path in absolute screen coordinates. A
-     * short drag (under [swipeThresholdPx]) directly moves the reticle window to follow the
-     * finger, for precise, immediate visual feedback while lining it up over a tap target. Once
-     * the drag clearly becomes a swipe, the window stops moving and freezes in place: repositioning
-     * a window on every move event while that same touch sequence is active is a known source of
-     * corrupted raw coordinates (the window-manager IPC to relocate a window can lag a frame
-     * behind the next touch sample), which would distort a long swipe's recorded path. A tap only
-     * needs its final settled position, so a short drag never risks that.
-     */
-    private inner class ReticleTouchListener(
-        private val params: WindowManager.LayoutParams,
-        private val view: View,
-        private val sizePx: Int,
-        private val swipeThresholdPx: Float
-    ) : View.OnTouchListener {
-        private var downRawX = 0f
-        private var downRawY = 0f
-        private var downParamX = 0
-        private var downParamY = 0
-        private var downElapsed = 0L
-        private var chasingWindow = true
-        private val pathPoints = mutableListOf<TouchPoint>()
+    private fun onSwipeButtonTapped() {
+        Log.d(TAG, "swipe button tapped (isRecording=$isRecording isPlaying=$isPlaying)")
+        if (isPlaying) return
+        if (!isRecording) {
+            Toast.makeText(this, "Start recording first, then tap this to log a swipe", Toast.LENGTH_SHORT).show()
+            return
+        }
+        startSwipeCapture()
+    }
 
-        override fun onTouch(v: View, event: MotionEvent): Boolean {
+    /**
+     * Arms a one-shot, full-screen capture window: the next single down-drag-up performed
+     * anywhere on the screen is logged as a swipe stroke and the window removes itself. It never
+     * moves for the whole gesture, so its raw coordinates are inherently reliable - no window
+     * repositioning during an active touch means none of the coordinate corruption that came from
+     * trying to reuse the small reticle for this. Being full-screen also means the swipe happens
+     * exactly where the user needs it (e.g. right over the list they want scrolled), not wherever
+     * a small dot happened to start out.
+     */
+    private fun startSwipeCapture() {
+        if (swipeCaptureView != null) return
+        val metrics = resources.displayMetrics
+        val overlay = View(this).apply {
+            setBackgroundColor(Color.argb(40, 255, 82, 82))
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+        }
+        val minDistancePx = MIN_SWIPE_DISTANCE_DP * metrics.density
+        var downElapsed = 0L
+        val pathPoints = mutableListOf<TouchPoint>()
+        overlay.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    downRawX = event.rawX
-                    downRawY = event.rawY
-                    downParamX = params.x
-                    downParamY = params.y
                     downElapsed = SystemClock.elapsedRealtime()
-                    chasingWindow = true
                     pathPoints.clear()
                     pathPoints.add(TouchPoint(event.rawX, event.rawY, 0L))
-                    return true
+                    true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (chasingWindow) {
-                        val distance = kotlin.math.hypot(
-                            (event.rawX - downRawX).toDouble(),
-                            (event.rawY - downRawY).toDouble()
-                        )
-                        if (distance >= swipeThresholdPx) {
-                            chasingWindow = false
-                            Log.v(TAG, "reticle: swipe threshold crossed mid-drag, freezing window to stop chasing the finger")
-                        } else {
-                            params.x = downParamX + (event.rawX - downRawX).toInt()
-                            params.y = downParamY + (event.rawY - downRawY).toInt()
-                            runCatching { windowManager.updateViewLayout(view, params) }
-                        }
-                    }
                     pathPoints.add(TouchPoint(event.rawX, event.rawY, SystemClock.elapsedRealtime() - downElapsed))
-                    return true
+                    true
                 }
                 MotionEvent.ACTION_UP -> {
-                    val distance = kotlin.math.hypot(
-                        (event.rawX - downRawX).toDouble(),
-                        (event.rawY - downRawY).toDouble()
-                    )
-                    if (distance >= swipeThresholdPx) {
+                    val first = pathPoints.first()
+                    val last = pathPoints.last()
+                    val distance = kotlin.math.hypot((last.x - first.x).toDouble(), (last.y - first.y).toDouble())
+                    if (distance >= minDistancePx) {
                         onSwipeRecorded(downElapsed, pathPoints.toList())
+                    } else {
+                        Log.d(TAG, "swipe capture: released with almost no movement, not logging")
+                        Toast.makeText(this, "No movement detected - try again", Toast.LENGTH_SHORT).show()
                     }
-                    return true
+                    endSwipeCapture()
+                    true
                 }
+                else -> false
             }
-            return false
         }
+        runCatching { windowManager.addView(overlay, params) }
+        swipeCaptureView = overlay
+        Toast.makeText(this, "Swipe or scroll now, anywhere on screen", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun endSwipeCapture() {
+        swipeCaptureView?.let { runCatching { windowManager.removeView(it) } }
+        swipeCaptureView = null
     }
 
     private fun onSwipeRecorded(downElapsed: Long, points: List<TouchPoint>) {
@@ -435,7 +449,7 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "autoclick_overlay"
         private const val RETICLE_SIZE_DP = 56
         private const val TAP_DURATION_MS = 60L
-        private const val SWIPE_THRESHOLD_DP = 24f
+        private const val MIN_SWIPE_DISTANCE_DP = 8f
     }
 }
 

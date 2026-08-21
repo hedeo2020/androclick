@@ -17,6 +17,15 @@
         android:src="@drawable/ic_record" />
 
     <ImageButton
+        android:id="@+id/btnSwipe"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:layout_marginStart="6dp"
+        android:background="@android:color/transparent"
+        android:contentDescription="@string/app_name"
+        android:src="@drawable/ic_swipe" />
+
+    <ImageButton
         android:id="@+id/btnPlay"
         android:layout_width="44dp"
         android:layout_height="44dp"
