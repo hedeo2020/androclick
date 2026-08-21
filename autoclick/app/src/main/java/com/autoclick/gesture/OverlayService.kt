@@ -137,7 +137,7 @@ class OverlayService : Service() {
         }
         windowManager.addView(view, params)
         bubbleView = view
-        updateStatus("idle")
+        updateStatus(idleStatusText())
     }
 
     /** Drag-to-move behaviour shared by the bubble and the reticle. */
@@ -233,15 +233,17 @@ class OverlayService : Service() {
 
         if (recordedStrokes.isEmpty()) {
             Log.d(TAG, "stopRecording: nothing recorded")
-            updateStatus("idle")
+            updateStatus(idleStatusText())
             Toast.makeText(this, "No points recorded", Toast.LENGTH_SHORT).show()
             return
         }
 
-        storage.save(GestureRecording(RecordingStorage.DEFAULT_NAME, recordedStrokes.toList()))
-        Log.d(TAG, "stopRecording: saved ${recordedStrokes.size} points")
-        updateStatus("saved (${recordedStrokes.size} pt${if (recordedStrokes.size == 1) "" else "s"})")
-        Toast.makeText(this, "Gesture saved", Toast.LENGTH_SHORT).show()
+        val name = storage.nextAutoName()
+        storage.save(GestureRecording(name, recordedStrokes.toList()))
+        storage.setActive(name)
+        Log.d(TAG, "stopRecording: saved ${recordedStrokes.size} strokes as '$name'")
+        updateStatus("saved '$name'")
+        Toast.makeText(this, "Saved as '$name' - rename it from the app screen", Toast.LENGTH_LONG).show()
     }
 
     private fun addReticle() {
@@ -396,7 +398,7 @@ class OverlayService : Service() {
             Toast.makeText(this, "Enable the AutoClick accessibility service first", Toast.LENGTH_LONG).show()
             return
         }
-        val recording = storage.latest()
+        val recording = storage.activeOrLatest()
         if (recording == null) {
             Log.w(TAG, "startPlayback: no saved recording found")
             Toast.makeText(this, "No recorded gesture yet", Toast.LENGTH_SHORT).show()
@@ -410,7 +412,7 @@ class OverlayService : Service() {
             Log.d(TAG, "startPlayback: playback finished")
             isPlaying = false
             setButtonIcon(R.id.btnPlay, R.drawable.ic_play)
-            updateStatus("idle")
+            updateStatus(idleStatusText())
         }
     }
 
@@ -419,7 +421,7 @@ class OverlayService : Service() {
         GestureAccessibilityService.instance?.stopPlayback()
         isPlaying = false
         setButtonIcon(R.id.btnPlay, R.drawable.ic_play)
-        updateStatus("idle")
+        updateStatus(idleStatusText())
     }
 
     // ---- helpers ----
@@ -427,6 +429,10 @@ class OverlayService : Service() {
     private fun updateStatus(text: String) {
         bubbleView?.findViewById<TextView>(R.id.txtStatus)?.text = text
     }
+
+    /** "idle" with the active recording's name, so the bubble shows what Play will run. */
+    private fun idleStatusText(): String =
+        storage.activeName()?.let { "idle ($it)" } ?: "idle"
 
     private fun setButtonIcon(viewId: Int, resId: Int) {
         bubbleView?.findViewById<ImageButton>(viewId)?.setImageResource(resId)

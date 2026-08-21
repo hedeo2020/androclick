@@ -8,4 +8,6 @@
     <string name="overlay_channel_name">AutoClick controls</string>
     <string name="notif_title">AutoClick is running</string>
     <string name="notif_text">Tap the floating bubble to record or play a gesture</string>
+    <string name="recordings_title">Saved recordings</string>
+    <string name="no_recordings">No recordings yet - record one from the floating bubble.</string>
 </resources>
