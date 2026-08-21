@@ -61,6 +61,13 @@ class RecordingStorage(context: Context) {
         prefs.edit().putString(KEY_ACTIVE, name).apply()
     }
 
+    /** Multiplier applied to every recorded stroke's timing during playback (1.0 = as recorded). */
+    fun playbackSpeed(): Float = prefs.getFloat(KEY_SPEED, 1f)
+
+    fun setPlaybackSpeed(speed: Float) {
+        prefs.edit().putFloat(KEY_SPEED, speed.coerceIn(MIN_SPEED, MAX_SPEED)).apply()
+    }
+
     /** The recording to play: the explicitly active one if it still exists, else the most recent. */
     fun activeOrLatest(): GestureRecording? {
         activeName()?.let { name -> load(name)?.let { return it } }
@@ -80,7 +87,10 @@ class RecordingStorage(context: Context) {
 
     companion object {
         const val DEFAULT_NAME = "last_recording"
+        const val MIN_SPEED = 0.25f
+        const val MAX_SPEED = 3f
         private const val PREFS_NAME = "autoclick_prefs"
         private const val KEY_ACTIVE = "active_recording"
+        private const val KEY_SPEED = "playback_speed"
     }
 }

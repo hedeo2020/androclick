@@ -12,6 +12,7 @@ import android.view.accessibility.AccessibilityManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
@@ -27,6 +28,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnToggleService: Button
     private lateinit var txtNoRecordings: TextView
     private lateinit var recordingsContainer: LinearLayout
+    private lateinit var txtSpeedLabel: TextView
+    private lateinit var seekSpeed: SeekBar
     private lateinit var storage: RecordingStorage
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -42,6 +45,22 @@ class MainActivity : AppCompatActivity() {
         btnToggleService = findViewById(R.id.btnToggleService)
         txtNoRecordings = findViewById(R.id.txtNoRecordings)
         recordingsContainer = findViewById(R.id.recordingsContainer)
+        txtSpeedLabel = findViewById(R.id.txtSpeedLabel)
+        seekSpeed = findViewById(R.id.seekSpeed)
+
+        val currentSpeed = storage.playbackSpeed()
+        seekSpeed.progress = speedToProgress(currentSpeed)
+        updateSpeedLabel(currentSpeed)
+        seekSpeed.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                val speed = progressToSpeed(progress)
+                updateSpeedLabel(speed)
+                if (fromUser) storage.setPlaybackSpeed(speed)
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar) = Unit
+        })
 
         btnGrantOverlay.setOnClickListener {
             startActivity(
@@ -94,6 +113,18 @@ class MainActivity : AppCompatActivity() {
         val am = getSystemService(ACCESSIBILITY_SERVICE) as AccessibilityManager
         val enabledServices = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
         return enabledServices.any { it.resolveInfo.serviceInfo.packageName == packageName }
+    }
+
+    // ---- playback speed ----
+
+    private fun progressToSpeed(progress: Int): Float =
+        RecordingStorage.MIN_SPEED + progress / 100f
+
+    private fun speedToProgress(speed: Float): Int =
+        ((speed - RecordingStorage.MIN_SPEED) * 100).toInt().coerceIn(0, seekSpeed.max)
+
+    private fun updateSpeedLabel(speed: Float) {
+        txtSpeedLabel.text = "Swipe/scroll speed: %.2fx".format(speed)
     }
 
     // ---- recordings list ----

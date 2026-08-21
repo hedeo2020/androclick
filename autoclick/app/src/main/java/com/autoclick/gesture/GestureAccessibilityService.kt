@@ -43,10 +43,28 @@ class GestureAccessibilityService : AccessibilityService() {
      */
     fun play(recording: GestureRecording, onFinished: () -> Unit) {
         cancelled = false
+        val speed = RecordingStorage(this).playbackSpeed()
+        val strokes = scaleStrokes(recording.strokes, speed)
         val maxDurationMs = maxGestureDurationMs()
-        val batches = batchStrokes(recording.strokes, maxDurationMs)
-        Log.d(TAG, "play: ${recording.strokes.size} strokes split into ${batches.size} batch(es), maxGestureDuration=${maxDurationMs}ms")
+        val batches = batchStrokes(strokes, maxDurationMs)
+        Log.d(TAG, "play: ${strokes.size} strokes (speed=${speed}x) split into ${batches.size} batch(es), maxGestureDuration=${maxDurationMs}ms")
         dispatchBatches(batches, 0, onFinished)
+    }
+
+    /**
+     * Scales every stroke's timing by [speed] (>1 = faster/shorter, <1 = slower/longer), keeping
+     * the recorded path's shape untouched. A swipe or scroll that plays back too fast or too slow
+     * for the target app's gesture detector often just doesn't register at all, so this lets
+     * playback speed be tuned independently of how quickly it was originally recorded.
+     */
+    private fun scaleStrokes(strokes: List<Stroke>, speed: Float): List<Stroke> {
+        if (speed == 1f) return strokes
+        return strokes.map { stroke ->
+            stroke.copy(
+                startOffsetMs = (stroke.startOffsetMs / speed).toLong(),
+                points = stroke.points.map { it.copy(offsetMs = (it.offsetMs / speed).toLong()) }
+            )
+        }
     }
 
     private fun dispatchBatches(batches: List<List<Stroke>>, index: Int, onFinished: () -> Unit) {

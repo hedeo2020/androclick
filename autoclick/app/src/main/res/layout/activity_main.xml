@@ -53,6 +53,29 @@
             android:layout_marginBottom="28dp" />
 
         <TextView
+            android:id="@+id/txtSpeedLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:text="Swipe/scroll speed: 1.00x"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="12sp"
+            android:text="If a swipe or scroll sometimes doesn't register in the target app, try a faster or slower speed."
+            android:layout_marginBottom="4dp" />
+
+        <SeekBar
+            android:id="@+id/seekSpeed"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="275"
+            android:layout_marginBottom="28dp" />
+
+        <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="@string/recordings_title"

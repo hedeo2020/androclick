@@ -9,9 +9,7 @@ import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.PixelFormat
-import android.graphics.PointF
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -49,13 +47,8 @@ class OverlayService : Service() {
 
     private var bubbleView: View? = null
 
-    // The reticle is two separate overlay windows. The anchor is the actual touch source and
-    // never moves mid-drag, so its raw coordinates stay reliable; the ghost is a purely visual,
-    // non-touchable, full-screen window that draws the whole drag path so far (not just a dot)
-    // so the user can see exactly where they are relative to where they started.
     private var reticleAnchorView: TargetReticleView? = null
     private var reticleAnchorParams: WindowManager.LayoutParams? = null
-    private var reticleGhostView: SwipeTrailView? = null
 
     private var isRecording = false
     private var isPlaying = false
@@ -268,61 +261,20 @@ class OverlayService : Service() {
     }
 
     private fun removeReticle() {
-        removeGhost()
         reticleAnchorView?.let { runCatching { windowManager.removeView(it) } }
         reticleAnchorView = null
         reticleAnchorParams = null
     }
 
     /**
-     * Adds the non-touchable ghost window covering the whole screen, starting the trail at the
-     * finger's down position. It's full-screen so the trail can be drawn anywhere without ever
-     * moving the window itself - since FLAG_NOT_TOUCHABLE excludes it from touch dispatch
-     * entirely, its size has no effect on what the rest of the screen can still receive.
-     */
-    private fun showGhost(dotRadiusPx: Float, screenX: Float, screenY: Float) {
-        val ghost = SwipeTrailView(this, dotRadiusPx)
-        ghost.reset(screenX, screenY)
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            overlayWindowType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 0
-            y = 0
-        }
-        runCatching { windowManager.addView(ghost, params) }
-        reticleGhostView = ghost
-    }
-
-    /** Extends the drawn trail to the finger's current position - no window move, just a redraw. */
-    private fun moveGhost(screenX: Float, screenY: Float) {
-        reticleGhostView?.addPoint(screenX, screenY)
-    }
-
-    private fun removeGhost() {
-        reticleGhostView?.let { runCatching { windowManager.removeView(it) } }
-        reticleGhostView = null
-    }
-
-    /**
-     * Tracks a drag starting on the anchor and records the full path in absolute screen
-     * coordinates. A short drag (under [swipeThresholdPx]) just repositions the anchor for a
-     * later tap; a longer, deliberate drag is logged as a swipe stroke on release.
-     *
-     * The anchor itself never moves until the single [WindowManager.updateViewLayout] call on
-     * release (and only for the tap-reposition case) - it is the window supplying the raw
-     * coordinates being recorded, and repositioning a window on every move event while that same
-     * touch sequence is active is a known source of corrupted raw coordinates (the
-     * window-manager IPC to relocate a window can lag a frame behind the next touch sample).
-     * Live visual feedback during the drag instead comes from a separate non-touchable ghost
-     * window ([showGhost]/[moveGhost]) that follows the finger - since it never receives touch
-     * input itself, moving it every frame carries no such risk.
+     * Tracks a drag on the reticle and records the full path in absolute screen coordinates. A
+     * short drag (under [swipeThresholdPx]) directly moves the reticle window to follow the
+     * finger, for precise, immediate visual feedback while lining it up over a tap target. Once
+     * the drag clearly becomes a swipe, the window stops moving and freezes in place: repositioning
+     * a window on every move event while that same touch sequence is active is a known source of
+     * corrupted raw coordinates (the window-manager IPC to relocate a window can lag a frame
+     * behind the next touch sample), which would distort a long swipe's recorded path. A tap only
+     * needs its final settled position, so a short drag never risks that.
      */
     private inner class ReticleTouchListener(
         private val params: WindowManager.LayoutParams,
@@ -335,6 +287,7 @@ class OverlayService : Service() {
         private var downParamX = 0
         private var downParamY = 0
         private var downElapsed = 0L
+        private var chasingWindow = true
         private val pathPoints = mutableListOf<TouchPoint>()
 
         override fun onTouch(v: View, event: MotionEvent): Boolean {
@@ -345,27 +298,36 @@ class OverlayService : Service() {
                     downParamX = params.x
                     downParamY = params.y
                     downElapsed = SystemClock.elapsedRealtime()
+                    chasingWindow = true
                     pathPoints.clear()
                     pathPoints.add(TouchPoint(event.rawX, event.rawY, 0L))
-                    showGhost(sizePx / 2f, event.rawX, event.rawY)
                     return true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    moveGhost(event.rawX, event.rawY)
+                    if (chasingWindow) {
+                        val distance = kotlin.math.hypot(
+                            (event.rawX - downRawX).toDouble(),
+                            (event.rawY - downRawY).toDouble()
+                        )
+                        if (distance >= swipeThresholdPx) {
+                            chasingWindow = false
+                            Log.v(TAG, "reticle: swipe threshold crossed mid-drag, freezing window to stop chasing the finger")
+                        } else {
+                            params.x = downParamX + (event.rawX - downRawX).toInt()
+                            params.y = downParamY + (event.rawY - downRawY).toInt()
+                            runCatching { windowManager.updateViewLayout(view, params) }
+                        }
+                    }
                     pathPoints.add(TouchPoint(event.rawX, event.rawY, SystemClock.elapsedRealtime() - downElapsed))
                     return true
                 }
                 MotionEvent.ACTION_UP -> {
-                    removeGhost()
-                    val dx = event.rawX - downRawX
-                    val dy = event.rawY - downRawY
-                    val distance = kotlin.math.hypot(dx.toDouble(), dy.toDouble())
+                    val distance = kotlin.math.hypot(
+                        (event.rawX - downRawX).toDouble(),
+                        (event.rawY - downRawY).toDouble()
+                    )
                     if (distance >= swipeThresholdPx) {
                         onSwipeRecorded(downElapsed, pathPoints.toList())
-                    } else {
-                        params.x = downParamX + dx.toInt()
-                        params.y = downParamY + dy.toInt()
-                        runCatching { windowManager.updateViewLayout(view, params) }
                     }
                     return true
                 }
@@ -509,61 +471,5 @@ private class TargetReticleView(context: Context, private val sizePx: Int) : Vie
         val loc = IntArray(2)
         getLocationOnScreen(loc)
         return Pair(loc[0] + width / 2f, loc[1] + height / 2f)
-    }
-}
-
-/**
- * Fills its (full-screen) window with the drag path recorded so far, plus a dot at the current
- * fingertip, so the user can see exactly where they are relative to where the drag started -
- * standing in for the fact that the real app underneath doesn't visually scroll while a gesture
- * is only being recorded, not yet played back.
- */
-private class SwipeTrailView(context: Context, private val dotRadiusPx: Float) : View(context) {
-
-    private val trailPoints = mutableListOf<PointF>()
-
-    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(220, 255, 82, 82)
-        style = Paint.Style.STROKE
-        strokeWidth = 8f
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-    }
-    private val dotFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(200, 255, 82, 82)
-        style = Paint.Style.FILL
-    }
-    private val dotStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        style = Paint.Style.STROKE
-        strokeWidth = 4f
-    }
-
-    init {
-        setWillNotDraw(false)
-    }
-
-    fun reset(x: Float, y: Float) {
-        trailPoints.clear()
-        trailPoints.add(PointF(x, y))
-        invalidate()
-    }
-
-    fun addPoint(x: Float, y: Float) {
-        trailPoints.add(PointF(x, y))
-        invalidate()
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        if (trailPoints.size >= 2) {
-            val path = Path()
-            path.moveTo(trailPoints[0].x, trailPoints[0].y)
-            for (i in 1 until trailPoints.size) path.lineTo(trailPoints[i].x, trailPoints[i].y)
-            canvas.drawPath(path, linePaint)
-        }
-        trailPoints.lastOrNull()?.let { p ->
-            canvas.drawCircle(p.x, p.y, dotRadiusPx, dotFillPaint)
-            canvas.drawCircle(p.x, p.y, dotRadiusPx, dotStrokePaint)
-        }
     }
 }
