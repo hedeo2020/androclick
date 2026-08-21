@@ -10,6 +10,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Region
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -21,7 +22,9 @@ import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewTreeObserver
 import android.view.WindowManager
+import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
@@ -46,7 +49,9 @@ class OverlayService : Service() {
     private lateinit var storage: RecordingStorage
 
     private var bubbleView: View? = null
-    private var reticleView: TargetReticleView? = null
+    private var reticleHostView: FrameLayout? = null
+    private var reticleDotView: TargetReticleView? = null
+    private var reticleInsetsListener: ViewTreeObserver.OnComputeInternalInsetsListener? = null
 
     private var isRecording = false
     private var isPlaying = false
@@ -198,9 +203,9 @@ class OverlayService : Service() {
     }
 
     private fun addTapPoint() {
-        val reticle = reticleView
+        val reticle = reticleDotView
         if (reticle == null) {
-            Log.w(TAG, "addTapPoint: reticleView is null, ignoring")
+            Log.w(TAG, "addTapPoint: reticleDotView is null, ignoring")
             return
         }
         val (x, y) = reticle.centerScreenPosition()
@@ -239,9 +244,35 @@ class OverlayService : Service() {
         val metrics = resources.displayMetrics
         val sizePx = (RETICLE_SIZE_DP * metrics.density).toInt()
         val swipeThresholdPx = SWIPE_THRESHOLD_DP * metrics.density
-        val view = TargetReticleView(this, sizePx)
+        val startLeft = (metrics.widthPixels - sizePx) / 2
+        val startTop = (metrics.heightPixels - sizePx) / 2
+
+        val dot = TargetReticleView(this, sizePx)
+        val host = FrameLayout(this)
+        host.addView(
+            dot,
+            FrameLayout.LayoutParams(sizePx, sizePx).apply {
+                leftMargin = startLeft
+                topMargin = startTop
+            }
+        )
+
+        // The window spans the full screen so the dot can be dragged anywhere on it, but only
+        // the small area the dot currently occupies is actually touchable - everywhere else in
+        // this window passes touches through to what's underneath, same as the old small window.
+        val insetsListener = ViewTreeObserver.OnComputeInternalInsetsListener { info ->
+            val lp = dot.layoutParams as FrameLayout.LayoutParams
+            info.touchableRegion.set(
+                Region(lp.leftMargin, lp.topMargin, lp.leftMargin + sizePx, lp.topMargin + sizePx)
+            )
+            info.setTouchableInsets(ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION)
+        }
+        host.viewTreeObserver.addOnComputeInternalInsetsListener(insetsListener)
+        reticleInsetsListener = insetsListener
+
         val params = WindowManager.LayoutParams(
-            sizePx, sizePx,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
             overlayWindowType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
@@ -249,47 +280,46 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = (metrics.widthPixels - sizePx) / 2
-            y = (metrics.heightPixels - sizePx) / 2
+            x = 0
+            y = 0
         }
-        view.setOnTouchListener(ReticleTouchListener(params, view, swipeThresholdPx))
-        windowManager.addView(view, params)
-        reticleView = view
+
+        host.setOnTouchListener(ReticleTouchListener(dot, swipeThresholdPx))
+        windowManager.addView(host, params)
+        reticleHostView = host
+        reticleDotView = dot
     }
 
     private fun removeReticle() {
-        reticleView?.let { runCatching { windowManager.removeView(it) } }
-        reticleView = null
+        reticleHostView?.let { host ->
+            reticleInsetsListener?.let { host.viewTreeObserver.removeOnComputeInternalInsetsListener(it) }
+            runCatching { windowManager.removeView(host) }
+        }
+        reticleHostView = null
+        reticleDotView = null
+        reticleInsetsListener = null
     }
 
     /**
-     * Drag-to-move the reticle like [DragTouchListener], but also records the full path in
-     * absolute screen coordinates. A short drag (under [swipeThresholdPx]) is treated as just
-     * repositioning the target for a later tap; a longer, deliberate drag is logged as a swipe
-     * stroke on release. A view that captures ACTION_DOWN keeps receiving ACTION_MOVE for that
-     * gesture even once the finger travels outside its bounds, so this works for full-screen
-     * swipes despite the reticle itself being small.
+     * Tracks a drag on the dot and records the full path in absolute screen coordinates. A short
+     * drag (under [swipeThresholdPx]) just repositions the target for a later tap; a longer,
+     * deliberate drag is logged as a swipe stroke on release.
      *
-     * Once the drag clearly becomes a swipe, the window stops chasing the finger (see
-     * [chasingWindow]). Repositioning an overlay window on every move event while that same
-     * touch sequence is still active is a known source of corrupted raw coordinates - the
-     * window-manager IPC to relocate the window can lag a frame behind the next touch sample,
-     * which was distorting the recorded path's shape on real swipes. For a tap-reposition drag
-     * (never crosses the threshold) the window keeps following the finger as before, since that
-     * visual feedback matters for precise placement and the drag is short enough not to trigger
-     * the issue.
+     * The dot visually follows the finger for the whole drag via [View.setTranslationX]/
+     * [View.setTranslationY] - a purely local render transform - rather than by moving the
+     * overlay window itself. Moving the window mid-touch (the earlier approach) was a known
+     * source of corrupted raw coordinates: the window-manager IPC to relocate the window could
+     * lag a frame behind the next touch sample, distorting the recorded path's shape on real
+     * swipes. Since the window here spans the whole screen and never moves, that failure mode
+     * can't happen, while the dot still tracks the finger the entire time.
      */
     private inner class ReticleTouchListener(
-        private val params: WindowManager.LayoutParams,
-        private val view: View,
+        private val dot: View,
         private val swipeThresholdPx: Float
     ) : View.OnTouchListener {
         private var downRawX = 0f
         private var downRawY = 0f
-        private var downParamX = 0
-        private var downParamY = 0
         private var downElapsed = 0L
-        private var chasingWindow = true
         private val pathPoints = mutableListOf<TouchPoint>()
 
         override fun onTouch(v: View, event: MotionEvent): Boolean {
@@ -297,40 +327,31 @@ class OverlayService : Service() {
                 MotionEvent.ACTION_DOWN -> {
                     downRawX = event.rawX
                     downRawY = event.rawY
-                    downParamX = params.x
-                    downParamY = params.y
                     downElapsed = SystemClock.elapsedRealtime()
-                    chasingWindow = true
                     pathPoints.clear()
                     pathPoints.add(TouchPoint(event.rawX, event.rawY, 0L))
                     return true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (chasingWindow) {
-                        val distance = kotlin.math.hypot(
-                            (event.rawX - downRawX).toDouble(),
-                            (event.rawY - downRawY).toDouble()
-                        )
-                        if (distance >= swipeThresholdPx) {
-                            chasingWindow = false
-                            Log.v(TAG, "reticle: swipe threshold crossed mid-drag, freezing window to stop chasing the finger")
-                        } else {
-                            params.x = downParamX + (event.rawX - downRawX).toInt()
-                            params.y = downParamY + (event.rawY - downRawY).toInt()
-                            runCatching { windowManager.updateViewLayout(view, params) }
-                        }
-                    }
+                    dot.translationX = event.rawX - downRawX
+                    dot.translationY = event.rawY - downRawY
                     pathPoints.add(TouchPoint(event.rawX, event.rawY, SystemClock.elapsedRealtime() - downElapsed))
                     return true
                 }
                 MotionEvent.ACTION_UP -> {
-                    val distance = kotlin.math.hypot(
-                        (event.rawX - downRawX).toDouble(),
-                        (event.rawY - downRawY).toDouble()
-                    )
+                    val dx = event.rawX - downRawX
+                    val dy = event.rawY - downRawY
+                    val distance = kotlin.math.hypot(dx.toDouble(), dy.toDouble())
                     if (distance >= swipeThresholdPx) {
                         onSwipeRecorded(downElapsed, pathPoints.toList())
+                    } else {
+                        val lp = dot.layoutParams as FrameLayout.LayoutParams
+                        lp.leftMargin += dx.toInt()
+                        lp.topMargin += dy.toInt()
+                        dot.layoutParams = lp
                     }
+                    dot.translationX = 0f
+                    dot.translationY = 0f
                     return true
                 }
             }
