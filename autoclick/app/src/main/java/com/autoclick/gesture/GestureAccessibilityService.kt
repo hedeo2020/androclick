@@ -69,7 +69,14 @@ class GestureAccessibilityService : AccessibilityService() {
                 if (i == 0) path.moveTo(point.x, point.y) else path.lineTo(point.x, point.y)
             }
             val relativeStart = stroke.startOffsetMs - batchStart
-            Log.d(TAG, "batch $index: stroke at (${stroke.points.first().x}, ${stroke.points.first().y}) relativeStart=${relativeStart}ms duration=${stroke.durationMs}ms")
+            val first = stroke.points.first()
+            val last = stroke.points.last()
+            Log.d(
+                TAG,
+                "batch $index: stroke ${stroke.points.size} pts, from (${first.x}, ${first.y}) to (${last.x}, ${last.y}), " +
+                    "dx=${last.x - first.x} dy=${last.y - first.y}, relativeStart=${relativeStart}ms duration=${stroke.durationMs}ms"
+            )
+            Log.v(TAG, "batch $index dispatch path: " + stroke.points.joinToString { "(${it.x},${it.y})@${it.offsetMs}ms" })
             builder.addStroke(GestureDescription.StrokeDescription(path, relativeStart, stroke.durationMs))
         }
 

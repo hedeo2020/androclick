@@ -269,6 +269,15 @@ class OverlayService : Service() {
      * stroke on release. A view that captures ACTION_DOWN keeps receiving ACTION_MOVE for that
      * gesture even once the finger travels outside its bounds, so this works for full-screen
      * swipes despite the reticle itself being small.
+     *
+     * Once the drag clearly becomes a swipe, the window stops chasing the finger (see
+     * [chasingWindow]). Repositioning an overlay window on every move event while that same
+     * touch sequence is still active is a known source of corrupted raw coordinates - the
+     * window-manager IPC to relocate the window can lag a frame behind the next touch sample,
+     * which was distorting the recorded path's shape on real swipes. For a tap-reposition drag
+     * (never crosses the threshold) the window keeps following the finger as before, since that
+     * visual feedback matters for precise placement and the drag is short enough not to trigger
+     * the issue.
      */
     private inner class ReticleTouchListener(
         private val params: WindowManager.LayoutParams,
@@ -280,6 +289,7 @@ class OverlayService : Service() {
         private var downParamX = 0
         private var downParamY = 0
         private var downElapsed = 0L
+        private var chasingWindow = true
         private val pathPoints = mutableListOf<TouchPoint>()
 
         override fun onTouch(v: View, event: MotionEvent): Boolean {
@@ -290,14 +300,26 @@ class OverlayService : Service() {
                     downParamX = params.x
                     downParamY = params.y
                     downElapsed = SystemClock.elapsedRealtime()
+                    chasingWindow = true
                     pathPoints.clear()
                     pathPoints.add(TouchPoint(event.rawX, event.rawY, 0L))
                     return true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    params.x = downParamX + (event.rawX - downRawX).toInt()
-                    params.y = downParamY + (event.rawY - downRawY).toInt()
-                    runCatching { windowManager.updateViewLayout(view, params) }
+                    if (chasingWindow) {
+                        val distance = kotlin.math.hypot(
+                            (event.rawX - downRawX).toDouble(),
+                            (event.rawY - downRawY).toDouble()
+                        )
+                        if (distance >= swipeThresholdPx) {
+                            chasingWindow = false
+                            Log.v(TAG, "reticle: swipe threshold crossed mid-drag, freezing window to stop chasing the finger")
+                        } else {
+                            params.x = downParamX + (event.rawX - downRawX).toInt()
+                            params.y = downParamY + (event.rawY - downRawY).toInt()
+                            runCatching { windowManager.updateViewLayout(view, params) }
+                        }
+                    }
                     pathPoints.add(TouchPoint(event.rawX, event.rawY, SystemClock.elapsedRealtime() - downElapsed))
                     return true
                 }
@@ -319,7 +341,15 @@ class OverlayService : Service() {
     private fun onSwipeRecorded(downElapsed: Long, points: List<TouchPoint>) {
         val offset = downElapsed - recordingStartElapsed
         recordedStrokes.add(Stroke(startOffsetMs = offset, points = points))
-        Log.d(TAG, "logged swipe #${recordedStrokes.size} with ${points.size} points, duration=${points.last().offsetMs}ms")
+        val first = points.first()
+        val last = points.last()
+        Log.d(
+            TAG,
+            "logged swipe #${recordedStrokes.size}: ${points.size} pts, " +
+                "from (${first.x}, ${first.y}) to (${last.x}, ${last.y}), " +
+                "dx=${last.x - first.x} dy=${last.y - first.y}, duration=${last.offsetMs}ms"
+        )
+        Log.v(TAG, "swipe #${recordedStrokes.size} full path: " + points.joinToString { "(${it.x},${it.y})@${it.offsetMs}ms" })
         Toast.makeText(this, "Swipe ${recordedStrokes.size} logged", Toast.LENGTH_SHORT).show()
     }
 
