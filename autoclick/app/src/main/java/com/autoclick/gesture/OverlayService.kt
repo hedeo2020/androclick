@@ -9,7 +9,9 @@ import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.PointF
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -49,11 +51,11 @@ class OverlayService : Service() {
 
     // The reticle is two separate overlay windows. The anchor is the actual touch source and
     // never moves mid-drag, so its raw coordinates stay reliable; the ghost is a purely visual,
-    // non-touchable window that follows the finger during a drag so the user gets live feedback.
+    // non-touchable, full-screen window that draws the whole drag path so far (not just a dot)
+    // so the user can see exactly where they are relative to where they started.
     private var reticleAnchorView: TargetReticleView? = null
     private var reticleAnchorParams: WindowManager.LayoutParams? = null
-    private var reticleGhostView: TargetReticleView? = null
-    private var reticleGhostParams: WindowManager.LayoutParams? = null
+    private var reticleGhostView: SwipeTrailView? = null
 
     private var isRecording = false
     private var isPlaying = false
@@ -270,41 +272,40 @@ class OverlayService : Service() {
         reticleAnchorParams = null
     }
 
-    /** Adds the non-touchable ghost window at the finger's current position when a drag starts. */
-    private fun showGhost(sizePx: Int, screenX: Float, screenY: Float) {
-        val ghost = TargetReticleView(this, sizePx)
+    /**
+     * Adds the non-touchable ghost window covering the whole screen, starting the trail at the
+     * finger's down position. It's full-screen so the trail can be drawn anywhere without ever
+     * moving the window itself - since FLAG_NOT_TOUCHABLE excludes it from touch dispatch
+     * entirely, its size has no effect on what the rest of the screen can still receive.
+     */
+    private fun showGhost(dotRadiusPx: Float, screenX: Float, screenY: Float) {
+        val ghost = SwipeTrailView(this, dotRadiusPx)
+        ghost.reset(screenX, screenY)
         val params = WindowManager.LayoutParams(
-            sizePx, sizePx,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
             overlayWindowType(),
-            // NOT_TOUCHABLE means this window never receives any touch input at all, so
-            // repositioning it every move event carries none of the raw-coordinate corruption
-            // risk that repositioning the anchor (the actual touch source) would.
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = (screenX - sizePx / 2f).toInt()
-            y = (screenY - sizePx / 2f).toInt()
+            x = 0
+            y = 0
         }
         runCatching { windowManager.addView(ghost, params) }
         reticleGhostView = ghost
-        reticleGhostParams = params
     }
 
+    /** Extends the drawn trail to the finger's current position - no window move, just a redraw. */
     private fun moveGhost(screenX: Float, screenY: Float) {
-        val ghost = reticleGhostView ?: return
-        val params = reticleGhostParams ?: return
-        params.x = (screenX - ghost.width / 2f).toInt()
-        params.y = (screenY - ghost.height / 2f).toInt()
-        runCatching { windowManager.updateViewLayout(ghost, params) }
+        reticleGhostView?.addPoint(screenX, screenY)
     }
 
     private fun removeGhost() {
         reticleGhostView?.let { runCatching { windowManager.removeView(it) } }
         reticleGhostView = null
-        reticleGhostParams = null
     }
 
     /**
@@ -344,7 +345,7 @@ class OverlayService : Service() {
                     downElapsed = SystemClock.elapsedRealtime()
                     pathPoints.clear()
                     pathPoints.add(TouchPoint(event.rawX, event.rawY, 0L))
-                    showGhost(sizePx, event.rawX, event.rawY)
+                    showGhost(sizePx / 2f, event.rawX, event.rawY)
                     return true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -502,5 +503,61 @@ private class TargetReticleView(context: Context, private val sizePx: Int) : Vie
         val loc = IntArray(2)
         getLocationOnScreen(loc)
         return Pair(loc[0] + width / 2f, loc[1] + height / 2f)
+    }
+}
+
+/**
+ * Fills its (full-screen) window with the drag path recorded so far, plus a dot at the current
+ * fingertip, so the user can see exactly where they are relative to where the drag started -
+ * standing in for the fact that the real app underneath doesn't visually scroll while a gesture
+ * is only being recorded, not yet played back.
+ */
+private class SwipeTrailView(context: Context, private val dotRadiusPx: Float) : View(context) {
+
+    private val trailPoints = mutableListOf<PointF>()
+
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(220, 255, 82, 82)
+        style = Paint.Style.STROKE
+        strokeWidth = 8f
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val dotFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(200, 255, 82, 82)
+        style = Paint.Style.FILL
+    }
+    private val dotStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
+
+    init {
+        setWillNotDraw(false)
+    }
+
+    fun reset(x: Float, y: Float) {
+        trailPoints.clear()
+        trailPoints.add(PointF(x, y))
+        invalidate()
+    }
+
+    fun addPoint(x: Float, y: Float) {
+        trailPoints.add(PointF(x, y))
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        if (trailPoints.size >= 2) {
+            val path = Path()
+            path.moveTo(trailPoints[0].x, trailPoints[0].y)
+            for (i in 1 until trailPoints.size) path.lineTo(trailPoints[i].x, trailPoints[i].y)
+            canvas.drawPath(path, linePaint)
+        }
+        trailPoints.lastOrNull()?.let { p ->
+            canvas.drawCircle(p.x, p.y, dotRadiusPx, dotFillPaint)
+            canvas.drawCircle(p.x, p.y, dotRadiusPx, dotStrokePaint)
+        }
     }
 }
